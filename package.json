@@ -1,6 +1,6 @@
 {
   "name": "jvc-hltb",
-  "version": "1.0.0",
+  "version": "1.0.2",
   "description": "A robust HowLongToBeat API client for Node.js that automatically extracts dynamic API keys using multiple methods to ensure reliable access to HLTB data",
   "main": "src/index.js",
   "types": "src/index.d.ts",

@@ -1,7 +1,8 @@
 /**
  * HowLongToBeat Client
- * A robust client for the HowLongToBeat API that automatically extracts
- * dynamic API keys using multiple methods to ensure reliable access to HLTB data.
+ * A robust client for the HowLongToBeat API that automatically captures the
+ * dynamic credentials the site requires (auth token + rotating key/value pair)
+ * to ensure reliable access to HLTB data.
  * 
  * @author JavocSoft (https://javocsoft.com)
  * @license MIT
@@ -25,9 +26,25 @@ declare class HLTBClient {
   baseUrl: string;
 
   /**
-   * How long to cache API keys (in minutes)
+   * Search route used against HowLongToBeat (e.g. "/api/search/site")
+   */
+  searchPath: string;
+
+  /**
+   * User-Agent used both to capture credentials and to replay requests.
+   * It is embedded in the auth token, so it must not differ between the two.
+   */
+  userAgent: string;
+
+  /**
+   * How long to cache credentials (in minutes)
    */
   cacheMinutes: number;
+
+  /**
+   * How long to stop relaunching the browser after a failed capture (in minutes)
+   */
+  failureCooldownMinutes: number;
 
   /**
    * Searches for a game on HowLongToBeat
@@ -65,16 +82,29 @@ declare class HLTBClient {
 
 interface HLTBClientOptions {
   /**
-   * How long to cache API keys (in minutes)
-   * @default 60
+   * How long to cache credentials (in minutes)
+   * @default 30
    */
   cacheMinutes?: number;
+
+  /**
+   * How long to stop relaunching the browser after a failed capture (in minutes).
+   * Prevents a broken HLTB site from spawning a browser on every lookup.
+   * @default 30
+   */
+  failureCooldownMinutes?: number;
 
   /**
    * Enable/disable the service
    * @default true
    */
   enabled?: boolean;
+
+  /**
+   * User-Agent used to capture credentials and to replay requests.
+   * The auth token embeds it, so both must match.
+   */
+  userAgent?: string;
 }
 
 interface HLTBDuration {
@@ -111,6 +141,11 @@ interface HLTBSearchResult {
   game_name: string;
 
   /**
+   * Alternative and regional titles, comma separated
+   */
+  game_alias: string;
+
+  /**
    * Game type (e.g., "game", "dlc")
    */
   game_type: string;
@@ -121,7 +156,7 @@ interface HLTBSearchResult {
   game_image: string;
 
   /**
-   * Main story completion time in seconds
+   * Main story completion time in seconds. 0 means "no data", not "0 hours".
    */
   comp_main: number;
 

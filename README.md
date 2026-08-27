@@ -1,6 +1,6 @@
 # jvc-hltb
 
-A robust **HowLongToBeat API client** for Node.js that automatically extracts dynamic API keys using multiple methods (Puppeteer interception, token extraction) to ensure reliable access to HLTB data.
+A robust **HowLongToBeat API client** for Node.js that automatically captures the dynamic credentials HLTB requires (Puppeteer request interception) to ensure reliable access to HLTB data.
 
 [![npm version](https://img.shields.io/npm/v/jvc-hltb.svg)](https://www.npmjs.com/package/jvc-hltb)
 [![npm downloads](https://img.shields.io/npm/dm/jvc-hltb.svg)](https://www.npmjs.com/package/jvc-hltb)
@@ -10,11 +10,12 @@ A robust **HowLongToBeat API client** for Node.js that automatically extracts dy
 
 ## 🎮 Features
 
-- ✅ **Multiple extraction methods** - Uses Puppeteer to intercept AJAX calls and extract dynamic API keys and auth tokens
-- ✅ **Dual authentication methods** - Supports both `/api/locate/<key>` and `/api/search` (with `x-auth-token`) endpoints
-- ✅ **Smart caching** - Caches keys for configurable time (default 60 minutes) to minimize browser launches
-- ✅ **Auto-recovery** - Automatically refreshes keys on 404 errors and retries with alternative methods
-- ✅ **Clear error handling** - Provides descriptive errors when all extraction methods fail
+- ✅ **Automatic credential capture** - Uses Puppeteer to intercept the site's own search call and keep the credentials it used
+- ✅ **Handles the rotating key** - Sends `x-auth-token`, `x-hp-key` and `x-hp-val`, plus the body field whose *name* is the key of the day
+- ✅ **Smart caching** - Caches credentials for a configurable time (default 30 minutes) to minimize browser launches
+- ✅ **Auto-recovery** - Recaptures once and retries when credentials go stale (401/403/404)
+- ✅ **Failure cooldown** - After a failed capture it stops relaunching the browser for 30 minutes, so a broken HLTB site can't spawn a browser per lookup
+- ✅ **Alias matching** - Also matches alternative and regional titles via `game_alias`
 - ✅ **Clean API** - Simple, promise-based interface
 - ✅ **TypeScript support** - Includes type definitions
 
@@ -48,6 +49,16 @@ sudo apt-get install -y \
     libxdamage1 \
     libxrandr2 \
     xdg-utils
+```
+
+Since **npm 11**, post-install scripts are blocked by default, so `npm install` may **not**
+download Chrome (it is mentioned in passing among the warnings as
+`allow-scripts ... puppeteer (postinstall)`). The install finishes in seconds, looks fine, and
+then the library fails to launch the browser. Install it explicitly:
+
+```bash
+npx puppeteer browsers install chrome
+npx puppeteer browsers list
 ```
 
 ## 🚀 Quick Start
@@ -87,14 +98,19 @@ Creates a new HowLongToBeat client instance.
 
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
-| `cacheMinutes` | number | 60 | How long to cache API keys (in minutes) |
+| `cacheMinutes` | number | 30 | How long to cache captured credentials (in minutes) |
+| `failureCooldownMinutes` | number | 30 | How long to stop relaunching the browser after a failed capture |
 | `enabled` | boolean | true | Enable/disable the service |
+| `userAgent` | string | Chrome 131 UA | User-Agent used to capture **and** to replay requests |
 
 ```javascript
 const hltb = new HLTBClient({
-  cacheMinutes: 120, // Cache keys for 2 hours
+  cacheMinutes: 60, // Cache credentials for 1 hour
 });
 ```
+
+> ⚠️ The auth token embeds the client IP **and** the User-Agent, so a token captured on one
+> machine will not work on another, and `userAgent` must be identical for capture and replay.
 
 ### `hltb.getGameDuration(gameName)`
 
@@ -183,13 +199,15 @@ await hltb.destroy();
 
 ## 🔧 How It Works
 
-HowLongToBeat.com uses dynamic API keys that change periodically. This library:
+HowLongToBeat.com protects its search endpoint with credentials that rotate and that cannot be
+forged (the token embeds the caller's IP and User-Agent). This library:
 
 1. **Launches a headless browser** using Puppeteer
-2. **Intercepts network requests** to capture the current API key
-3. **Caches the key** for efficient reuse (default: 60 minutes)
-4. **Uses dual methods** - tries `/api/locate/{key}` first, falls back to `/api/search` with auth token
-5. **Auto-recovers** from 404 errors by refreshing the key
+2. **Intercepts the site's own search request** and keeps its `x-auth-token`, `x-hp-key` and `x-hp-val`
+3. **Caches those credentials** for efficient reuse (default: 30 minutes) - the browser opens once per cache window, not per search
+4. **Replays plain HTTP** against `POST /api/search/site`, changing only the search terms
+5. **Auto-recovers** from 401/403/404 by recapturing once and retrying
+6. **Backs off** for 30 minutes after a failed capture instead of relaunching a browser on every lookup
 
 ### Architecture
 
@@ -203,16 +221,18 @@ HowLongToBeat.com uses dynamic API keys that change periodically. This library:
 │  jvc-hltb                                                   │
 │                                                             │
 │  ┌─────────────────────────────────────────────────────┐   │
-│  │ Key Management                                      │   │
-│  │ - Extract keys with Puppeteer (headless browser)   │   │
-│  │ - Cache keys for 60 minutes                        │   │
-│  │ - Auto-refresh on expiry or 404                    │   │
+│  │ Credential Management                               │   │
+│  │ - Capture with Puppeteer (headless browser)        │   │
+│  │ - Cache credentials for 30 minutes                 │   │
+│  │ - Recapture once on 401/403/404                    │   │
+│  │ - Cool down 30 min after a failed capture          │   │
 │  └─────────────────────────────────────────────────────┘   │
 │                                                             │
 │  ┌─────────────────────────────────────────────────────┐   │
-│  │ Search Methods                                      │   │
-│  │ - Method 1: POST /api/locate/{searchKey}           │   │
-│  │ - Method 2: POST /api/search with x-auth-token     │   │
+│  │ Search                                              │   │
+│  │ - POST /api/search/site                            │   │
+│  │ - Headers: x-auth-token, x-hp-key, x-hp-val        │   │
+│  │ - Body also carries a field named after the key    │   │
 │  └─────────────────────────────────────────────────────┘   │
 └────────────────┬────────────────────────────────────────────┘
                  │
@@ -277,7 +297,7 @@ main();
 const HLTBClient = require('jvc-hltb');
 
 const hltb = new HLTBClient({
-  cacheMinutes: 120,  // Cache keys for 2 hours
+  cacheMinutes: 60,  // Cache credentials for 1 hour
 });
 
 // Your code here...
@@ -316,13 +336,42 @@ async function getGameTime(gameName) {
 
 ## ⚠️ Important Notes
 
-1. **Puppeteer requirement**: This library uses Puppeteer for key extraction, which downloads Chromium (~170MB). Consider this for deployment.
+1. **Puppeteer requirement**: This library uses Puppeteer to capture credentials, which downloads Chromium (~170MB). Consider this for deployment.
 
-2. **Rate limiting**: While this library caches keys, avoid making too many requests in a short time to respect HLTB's servers.
+2. **Rate limiting**: While this library caches credentials, avoid making too many requests in a short time to respect HLTB's servers.
 
-3. **Exact matches only**: `getGameDuration()` returns data only for exact name matches (case-insensitive). Use `searchGame()` for fuzzy results.
+3. **Exact matches only**: `getGameDuration()` returns data only for exact name matches (case-insensitive), including `game_alias`. Use `searchGame()` for fuzzy results.
 
-4. **Headless browser**: The first request may take a few seconds as Puppeteer launches a browser. Subsequent requests use cached keys.
+4. **Headless browser**: The first request may take a few seconds as Puppeteer launches a browser. Subsequent requests reuse the cached credentials.
+
+5. **Times of `0` mean "no data"**, not "0 hours" - the library maps them to `null`.
+
+6. **The token is bound to your IP**: behind a rotating proxy or NAT egress a captured token can
+   stop working immediately. The recapture-and-retry covers it, but it explains intermittent 403s.
+
+### Troubleshooting
+
+| Symptom | Likely cause |
+|---------|--------------|
+| `No search request was seen; HLTB may have moved the route again` | HLTB changed the search route. See below. |
+| `Navigation timeout of 30000 ms exceeded` | Not enough RAM - Chrome never loads the page. 1 GB is not enough; 2 GB works. Fix memory before suspecting the API. |
+| `Could not find Chrome (ver. ...)` | Post-install script was skipped. Run `npx puppeteer browsers install chrome`. |
+| Everything returns `null`, nothing throws | Usually the route move above; check the log for the capture warning. |
+
+**If HLTB moves the search route again**, it can be found without a browser:
+
+```bash
+UA='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36'
+curl -s -A "$UA" https://howlongtobeat.com/ -o page.html
+grep -oE '/_next/static/chunks/[a-zA-Z0-9._/-]+\.js' page.html | sort -u > chunks.txt
+mkdir -p js && cd js
+while read -r u; do curl -s -A "$UA" "https://howlongtobeat.com$u" -O; done < ../chunks.txt
+grep -ohE '"/api/[a-zA-Z0-9_/-]*"' *.js | sort -u
+```
+
+The right one is the route used inside a `fetch(..., { method: "POST" })` carrying the
+`x-auth-token`, `x-hp-key` and `x-hp-val` headers. Update `SEARCH_PATH` in `src/index.js`
+(or pass a different `searchPath` on the instance).
 
 ## 🤝 Contributing
 

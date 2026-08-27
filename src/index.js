@@ -3,60 +3,100 @@ const puppeteer = require('puppeteer');
 
 /**
  * HowLongToBeat Client
- * 
- * A robust client for the HowLongToBeat API that automatically extracts
- * dynamic API keys using multiple methods (Puppeteer interception, token extraction)
- * to ensure reliable access to HLTB data.
- * 
+ *
+ * A robust client for the HowLongToBeat API that automatically captures the
+ * dynamic credentials the site requires (auth token + per-day key/value pair)
+ * with Puppeteer, then reuses them over plain HTTP.
+ *
  * @author JavocSoft (https://javocsoft.com)
  * @license MIT
- * 
- * API Endpoints:
- * - Primary: POST https://howlongtobeat.com/api/locate/<search_key>
- * - Alternative: POST https://howlongtobeat.com/api/search (with x-auth-token header)
- * 
- * The <search_key> is a 16-character hexadecimal token that changes periodically.
- * Puppeteer intercepts network requests to capture this token automatically.
- * 
+ *
+ * API endpoint:
+ * - POST https://howlongtobeat.com/api/search/site
+ *
+ * The endpoint requires three headers captured from a real page load:
+ * - x-auth-token: base64 blob that embeds the client IP and User-Agent
+ * - x-hp-key:     the key of the day (e.g. "ign_0686331a"), it rotates
+ * - x-hp-val:     the value that goes with it (16 hex chars)
+ *
+ * The same value must also be sent inside the body, in a property whose NAME
+ * is the key of the day (body[hpKey] = hpValue). Without it the API answers
+ * 404; without x-hp-val it answers 403.
+ *
+ * Because the token embeds the IP and the User-Agent, it cannot be forged and
+ * it must be replayed with the exact same User-Agent used to capture it.
+ *
  * Response time format:
  * - comp_main: Main Story time (in seconds)
  * - comp_plus: Main + Extras time (in seconds)
  * - comp_100: Completionist time (in seconds)
- * 
- * Conversion: divide by 3600 to get hours
+ *
+ * Conversion: divide by 3600 to get hours. A 0 means "no data", not "0 hours".
  */
+
+const BASE_URL = 'https://howlongtobeat.com';
+
+/** Search route. HLTB has moved it several times; see README if it 404s. */
+const SEARCH_PATH = '/api/search/site';
+
+/** Must be identical when capturing and when replaying: it is inside the token. */
+const DEFAULT_USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
+  + '(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
+
+const DEFAULT_CACHE_MINUTES = 30;
+const DEFAULT_FAILURE_COOLDOWN_MINUTES = 30;
+
+/** Statuses that mean "stale credentials", the only ones worth a recapture. */
+const STALE_CREDENTIAL_STATUSES = [401, 403, 404];
+
+const CAPTURE_NAVIGATION_TIMEOUT_MS = 30000;
+const CAPTURE_WAIT_TIMEOUT_MS = 15000;
+const REQUEST_TIMEOUT_MS = 15000;
+
 class HLTBClient {
   /**
    * Creates a new HowLongToBeat client
    * @param {Object} options - Configuration options
-   * @param {number} options.cacheMinutes - How long to cache API keys (default: 60)
+   * @param {number} options.cacheMinutes - How long to cache credentials (default: 30)
+   * @param {number} options.failureCooldownMinutes - How long to stop relaunching the
+   *   browser after a failed capture (default: 30)
    * @param {boolean} options.enabled - Enable/disable the service (default: true)
+   * @param {string} options.userAgent - User-Agent used to capture and to replay
    */
   constructor(options = {}) {
     this.enabled = options.enabled !== false;
-    this.baseUrl = 'https://howlongtobeat.com';
-    this.searchKey = null;
-    this.searchKeyExpiry = null;
-    this.authToken = null;
-    this.authTokenExpiry = null;
-    this.cacheMinutes = options.cacheMinutes || 60;
+    this.baseUrl = BASE_URL;
+    this.searchPath = SEARCH_PATH;
+    this.userAgent = options.userAgent || DEFAULT_USER_AGENT;
+    this.cacheMinutes = options.cacheMinutes || DEFAULT_CACHE_MINUTES;
+    this.failureCooldownMinutes = options.failureCooldownMinutes || DEFAULT_FAILURE_COOLDOWN_MINUTES;
+
+    /** @type {{authToken: string, hpKey: string, hpValue: string}|null} */
+    this.credentials = null;
+    this.credentialsExpiry = null;
+
+    /** Negative cache: a capture that just failed will not work seconds later. */
+    this.failureUntil = null;
+
     this.browser = null;
   }
 
   /**
-   * Extracts the search key AND auth token by intercepting AJAX calls with Puppeteer
-   * @returns {Promise<{searchKey: string|null, authToken: string|null}>}
+   * Opens a headless browser, lets the page perform its own search request and
+   * keeps the credentials it used.
+   * @returns {Promise<{authToken: string, hpKey: string, hpValue: string}|null>}
    * @private
    */
-  async _extractKeysWithPuppeteer() {
+  async _captureCredentials() {
     let browser = null;
-    let page = null;
-    
+
     try {
-      console.log('[HLTB] Launching headless browser to extract keys...');
-      
+      console.log('[HLTB] Launching headless browser to capture credentials...');
+
       browser = await puppeteer.launch({
-        headless: 'new',
+        // Since puppeteer 22, `true` IS the new headless mode.
+        // The 'new' string was deprecated and later removed.
+        headless: true,
         args: [
           '--no-sandbox',
           '--disable-setuid-sandbox',
@@ -65,129 +105,142 @@ class HLTBClient {
           '--disable-gpu'
         ]
       });
+      this.browser = browser;
 
-      page = await browser.newPage();
-      
-      await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
-      
-      let searchKey = null;
-      let authToken = null;
-      
-      await page.setRequestInterception(true);
-      
+      const page = await browser.newPage();
+      await page.setUserAgent(this.userAgent);
+
+      let captured = null;
+      let onCaptured = null;
+      const capturedPromise = new Promise((resolve) => { onCaptured = resolve; });
+
       page.on('request', (request) => {
-        const url = request.url();
+        if (captured) return;
+        if (request.method() !== 'POST') return;
+        if (!request.url().startsWith(`${this.baseUrl}${this.searchPath}`)) return;
+
         const headers = request.headers();
-        
-        // Look for API locate calls to extract search key
-        if (url.includes('/api/locate/')) {
-          const match = url.match(/\/api\/locate\/([a-f0-9]+)/i);
-          if (match && match[1] && match[1].length >= 16) {
-            searchKey = match[1];
-            console.log(`[HLTB] ✓ Search key intercepted: ${searchKey}`);
+        const authToken = headers['x-auth-token'];
+        const hpKey = headers['x-hp-key'];
+        if (!authToken || !hpKey) return;
+
+        // The same value travels as a header and as a body field named after the key
+        let hpValue = headers['x-hp-val'] || null;
+        if (!hpValue) {
+          try {
+            hpValue = JSON.parse(request.postData() || '{}')[hpKey] || null;
+          } catch (error) {
+            hpValue = null;
           }
         }
-        
-        // Look for API search calls to extract x-auth-token
-        if (url.includes('/api/search')) {
-          if (headers['x-auth-token']) {
-            authToken = headers['x-auth-token'];
-            console.log(`[HLTB] ✓ Auth token intercepted: ${authToken}`);
-          }
+
+        if (hpValue) {
+          captured = { authToken, hpKey, hpValue };
+          onCaptured();
         }
-        
-        request.continue();
       });
-      
-      console.log('[HLTB] Loading HLTB search page...');
-      await page.goto(`${this.baseUrl}/?q=test`, {
-        waitUntil: 'networkidle2',
-        timeout: 30000
+
+      // Any term works: what matters is the request the page fires because of it
+      await page.goto(`${this.baseUrl}/?q=zelda`, {
+        waitUntil: 'domcontentloaded',
+        timeout: CAPTURE_NAVIGATION_TIMEOUT_MS
       });
-      
-      // Wait for AJAX calls to complete
-      await new Promise(resolve => setTimeout(resolve, 2000));
-      
-      await browser.close();
-      browser = null;
-      
-      if (searchKey || authToken) {
-        console.log(`[HLTB] ✓ Extraction results - SearchKey: ${searchKey || 'none'}, AuthToken: ${authToken || 'none'}`);
+
+      // The site debounces the search ~1s, so wait for the request itself
+      // instead of a fixed sleep, and give up if it never arrives
+      await this._waitFor(capturedPromise, CAPTURE_WAIT_TIMEOUT_MS);
+
+      if (captured) {
+        console.log(`[HLTB] ✓ Credentials captured (key: ${captured.hpKey})`);
       } else {
-        console.log('[HLTB] ⚠️ Could not extract any keys from network requests');
+        console.warn('[HLTB] ⚠️ No search request was seen; HLTB may have moved the route again '
+          + `(expected POST ${this.baseUrl}${this.searchPath})`);
       }
-      
-      return { searchKey, authToken };
-      
+
+      return captured;
+
     } catch (error) {
-      console.error('[HLTB] Error extracting keys with Puppeteer:', error.message);
+      console.error('[HLTB] Error capturing credentials:', error.message);
+      return null;
+    } finally {
       if (browser) {
-        try {
-          await browser.close();
-        } catch (e) {
-          // Ignore close errors
-        }
+        await browser.close().catch(() => {});
       }
-      return { searchKey: null, authToken: null };
+      if (this.browser === browser) {
+        this.browser = null;
+      }
     }
   }
 
   /**
-   * Gets or refreshes the API keys (searchKey and authToken)
-   * @returns {Promise<{searchKey: string|null, authToken: string|null}>}
+   * Resolves when `promise` settles or when the timeout elapses, whichever
+   * comes first, without leaving a pending timer behind.
+   * @param {Promise<any>} promise
+   * @param {number} timeoutMs
+   * @returns {Promise<void>}
    * @private
    */
-  async _getKeys() {
+  async _waitFor(promise, timeoutMs) {
+    let timer = null;
     try {
-      const searchKeyValid = this.searchKey && this.searchKeyExpiry && Date.now() < this.searchKeyExpiry;
-      const authTokenValid = this.authToken && this.authTokenExpiry && Date.now() < this.authTokenExpiry;
-      
-      if (searchKeyValid && authTokenValid) {
-        console.log('[HLTB] Using cached keys');
-        return { searchKey: this.searchKey, authToken: this.authToken };
-      }
-
-      console.log('[HLTB] Keys expired or missing, extracting new ones...');
-      const { searchKey, authToken } = await this._extractKeysWithPuppeteer();
-      
-      if (searchKey) {
-        this.searchKey = searchKey;
-        this.searchKeyExpiry = Date.now() + (this.cacheMinutes * 60 * 1000);
-        console.log(`[HLTB] ✓ Search key cached until: ${new Date(this.searchKeyExpiry).toLocaleString()}`);
-      }
-      
-      if (authToken) {
-        this.authToken = authToken;
-        this.authTokenExpiry = Date.now() + (this.cacheMinutes * 60 * 1000);
-        console.log(`[HLTB] ✓ Auth token cached until: ${new Date(this.authTokenExpiry).toLocaleString()}`);
-      }
-      
-      // If no keys were extracted and none are cached, we cannot proceed
-      if (!this.searchKey && !this.authToken) {
-        throw new Error('Failed to extract API keys: Could not obtain search key or auth token from HowLongToBeat. The website structure may have changed.');
-      }
-      
-      return { searchKey: this.searchKey, authToken: this.authToken };
-      
-    } catch (error) {
-      console.error('[HLTB] Error getting keys:', error.message);
-      throw error;
+      await Promise.race([
+        promise,
+        new Promise((resolve) => { timer = setTimeout(resolve, timeoutMs); })
+      ]);
+    } finally {
+      if (timer) clearTimeout(timer);
     }
   }
 
   /**
-   * Performs a search using /api/locate/<searchKey>
-   * @param {string} gameName - Name of the game
-   * @param {string} searchKey - Search key to use
-   * @returns {Promise<Array>}
+   * Returns valid credentials, capturing them if needed.
+   * Does not insist when a capture has just failed: launching a browser to find
+   * out again is exactly what melts small servers when HLTB changes its site.
+   * @param {boolean} force - Ignore the cached credentials and capture new ones
+   * @returns {Promise<{authToken: string, hpKey: string, hpValue: string}|null>}
    * @private
    */
-  async _performSearchWithLocate(gameName, searchKey) {
-    const searchTerms = gameName.trim().toLowerCase().split(/\s+/);
+  async _getCredentials(force = false) {
+    const valid = this.credentials && this.credentialsExpiry && Date.now() < this.credentialsExpiry;
+    if (valid && !force) {
+      console.log('[HLTB] Using cached credentials');
+      return this.credentials;
+    }
 
-    const payload = {
+    if (this.failureUntil && Date.now() < this.failureUntil) {
+      return null;
+    }
+
+    const captured = await this._captureCredentials();
+
+    if (captured) {
+      this.credentials = captured;
+      this.credentialsExpiry = Date.now() + (this.cacheMinutes * 60 * 1000);
+      this.failureUntil = null;
+      console.log(`[HLTB] ✓ Credentials cached until: ${new Date(this.credentialsExpiry).toLocaleString()}`);
+    } else {
+      this.credentials = null;
+      this.credentialsExpiry = null;
+      this.failureUntil = Date.now() + (this.failureCooldownMinutes * 60 * 1000);
+      // Warn once, when the breaker opens, not on every search that finds it open
+      console.warn('[HLTB] Capture failed; not retrying until '
+        + new Date(this.failureUntil).toLocaleTimeString());
+    }
+
+    return this.credentials;
+  }
+
+  /**
+   * Builds the search body. The last property is named after the key of the day.
+   * @param {string} gameName - Name of the game
+   * @param {{hpKey: string, hpValue: string}} credentials - Captured credentials
+   * @returns {Object}
+   * @private
+   */
+  _buildPayload(gameName, credentials) {
+    return {
       searchType: 'games',
-      searchTerms: searchTerms,
+      searchTerms: gameName.trim().toLowerCase().split(/\s+/),
       searchPage: 1,
       size: 20,
       searchOptions: {
@@ -222,176 +275,74 @@ class HLTBClient {
         sort: 0,
         randomizer: 0
       },
-      useCache: false
+      useCache: true,
+      [credentials.hpKey]: credentials.hpValue // without this: 404
     };
-
-    const response = await axios.post(
-      `${this.baseUrl}/api/locate/${searchKey}`,
-      payload,
-      {
-        headers: {
-          'Content-Type': 'application/json',
-          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-          'Referer': this.baseUrl,
-          'Origin': this.baseUrl
-        },
-        timeout: 15000
-      }
-    );
-
-    return response.data.data || [];
   }
 
   /**
-   * Performs a search using /api/search with x-auth-token
-   * @param {string} gameName - Name of the game
-   * @param {string} authToken - Auth token to use
-   * @returns {Promise<Array>}
+   * Builds the request headers.
+   * @param {{authToken: string, hpKey: string, hpValue: string}} credentials
+   * @returns {Object}
    * @private
    */
-  async _performSearchWithAuthToken(gameName, authToken) {
-    const searchTerms = gameName.trim().toLowerCase().split(/\s+/);
-
-    const payload = {
-      searchType: 'games',
-      searchTerms: searchTerms,
-      searchPage: 1,
-      size: 20,
-      searchOptions: {
-        games: {
-          userId: 0,
-          platform: '',
-          sortCategory: 'popular',
-          rangeCategory: 'main',
-          rangeTime: {
-            min: null,
-            max: null
-          },
-          gameplay: {
-            perspective: '',
-            flow: '',
-            genre: '',
-            difficulty: ''
-          },
-          rangeYear: {
-            min: '',
-            max: ''
-          },
-          modifier: ''
-        },
-        users: {
-          sortCategory: 'postcount'
-        },
-        lists: {
-          sortCategory: 'follows'
-        },
-        filter: '',
-        sort: 0,
-        randomizer: 0
-      },
-      useCache: false
+  _buildHeaders(credentials) {
+    return {
+      'Content-Type': 'application/json',
+      'User-Agent': this.userAgent, // must be the one baked into the token
+      'Referer': `${this.baseUrl}/`,
+      'Origin': this.baseUrl,
+      'x-auth-token': credentials.authToken,
+      'x-hp-key': credentials.hpKey,
+      'x-hp-val': credentials.hpValue // without this: 403
     };
-
-    const response = await axios.post(
-      `${this.baseUrl}/api/search`,
-      payload,
-      {
-        headers: {
-          'Content-Type': 'application/json',
-          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-          'Referer': this.baseUrl,
-          'Origin': this.baseUrl,
-          'x-auth-token': authToken
-        },
-        timeout: 15000
-      }
-    );
-
-    return response.data.data || [];
   }
 
   /**
-   * Searches for a game on HowLongToBeat
-   * Tries /api/locate/<searchKey> first, then falls back to /api/search with auth token
+   * Searches for a game on HowLongToBeat.
+   * Stale credentials are retried exactly once with a fresh capture, which is
+   * the same policy the site itself follows on a 403.
    * @param {string} gameName - Name of the game to search
    * @returns {Promise<Array|null>} - Array of search results or null on error
    */
   async searchGame(gameName) {
-    let searchKey = null;
-    let authToken = null;
-    
     try {
-      console.log(`[HLTB] Searching for: ${gameName}`);
+      for (const force of [false, true]) {
+        const credentials = await this._getCredentials(force);
+        if (!credentials) {
+          if (force) break;
+          continue;
+        }
 
-      const keys = await this._getKeys();
-      searchKey = keys.searchKey;
-      authToken = keys.authToken;
-      
-      // METHOD 1: Try /api/locate/<searchKey>
-      if (searchKey) {
         try {
-          console.log('[HLTB] Trying method 1: /api/locate with search key');
-          const results = await this._performSearchWithLocate(gameName, searchKey);
-          console.log(`[HLTB] ✓ Method 1 successful, found ${results.length} results`);
+          const response = await axios.post(
+            `${this.baseUrl}${this.searchPath}`,
+            this._buildPayload(gameName, credentials),
+            { headers: this._buildHeaders(credentials), timeout: REQUEST_TIMEOUT_MS }
+          );
+
+          const results = response.data.data || [];
+          console.log(`[HLTB] ✓ Search successful, found ${results.length} results`);
           return results;
-          
+
         } catch (error) {
-          if (error.response?.status === 404) {
-            const attemptedUrl = `${this.baseUrl}/api/locate/${searchKey}`;
-            console.log(`[HLTB] Method 1 failed with 404 - URL: ${attemptedUrl}`);
-            
-            // Force key refresh
-            this.searchKey = null;
-            this.searchKeyExpiry = null;
-            this.authToken = null;
-            this.authTokenExpiry = null;
-            
-            const newKeys = await this._getKeys();
-            
-            // Retry with new search key
-            if (newKeys.searchKey) {
-              try {
-                const results = await this._performSearchWithLocate(gameName, newKeys.searchKey);
-                console.log(`[HLTB] ✓ Method 1 retry successful, found ${results.length} results`);
-                return results;
-              } catch (retryError) {
-                console.log(`[HLTB] Method 1 retry also failed: ${retryError.message}`);
-                authToken = newKeys.authToken;
-              }
-            } else {
-              authToken = newKeys.authToken;
-            }
-          } else {
-            console.log(`[HLTB] Method 1 failed: ${error.message}`);
+          const status = error.response?.status;
+
+          // Only stale credentials deserve a retry; anything else is a real error
+          if (force || !status || !STALE_CREDENTIAL_STATUSES.includes(status)) {
+            throw error;
           }
+
+          console.log(`[HLTB] Search failed with ${status}, refreshing credentials and retrying once...`);
         }
-      } else {
-        console.log('[HLTB] No search key available, skipping method 1');
       }
-      
-      // METHOD 2: Try /api/search with x-auth-token as fallback
-      if (authToken) {
-        try {
-          console.log('[HLTB] Trying method 2: /api/search with auth token');
-          const results = await this._performSearchWithAuthToken(gameName, authToken);
-          console.log(`[HLTB] ✓ Method 2 successful, found ${results.length} results`);
-          return results;
-        } catch (error) {
-          console.log(`[HLTB] Method 2 failed: ${error.message}`);
-          throw error;
-        }
-      } else {
-        console.log('[HLTB] No auth token available, cannot use method 2');
-        throw new Error('Both search methods unavailable - no valid keys');
-      }
+
+      console.error('[HLTB] Could not obtain HowLongToBeat credentials');
+      return null;
 
     } catch (error) {
-      const methodInfo = searchKey 
-        ? `Method 1 URL: ${this.baseUrl}/api/locate/${searchKey}` 
-        : authToken 
-          ? `Method 2 URL: ${this.baseUrl}/api/search` 
-          : 'No methods available';
-      console.error(`[HLTB] Error searching game: ${error.message} - ${methodInfo}`);
+      console.error(`[HLTB] Error searching game: ${error.message} `
+        + `- URL: ${this.baseUrl}${this.searchPath}`);
       return null;
     }
   }
@@ -415,15 +366,29 @@ class HLTBClient {
    */
   formatDuration(hours) {
     if (!hours || hours <= 0) return null;
-    
+
     const wholeHours = Math.floor(hours);
     const minutes = Math.round((hours - wholeHours) * 60);
-    
+
     if (minutes === 0) {
       return `${wholeHours}h`;
     }
-    
+
     return `${wholeHours}h ${minutes}m`;
+  }
+
+  /**
+   * Checks whether a result matches the searched name, either by its name or by
+   * one of its aliases (HLTB stores alternative and regional titles there).
+   * @param {Object} game - A search result
+   * @param {string} searchName - Searched name, already trimmed and lowercased
+   * @returns {boolean}
+   * @private
+   */
+  _matchesAlias(game, searchName) {
+    const alias = (game.game_alias || '').trim().toLowerCase();
+    if (!alias) return false;
+    return alias.split(',').some(part => part.trim() === searchName);
   }
 
   /**
@@ -462,12 +427,10 @@ class HLTBClient {
         complete: this.secondsToHours(r.comp_100)
       })));
 
-      // Find exact match (case-insensitive)
-      const exactMatch = results.find(game => {
-        const resultName = game.game_name.trim().toLowerCase();
-        const searchName = gameName.trim().toLowerCase();
-        return resultName === searchName;
-      });
+      // Find exact match (case-insensitive), preferring the name over an alias
+      const searchName = gameName.trim().toLowerCase();
+      const exactMatch = results.find(game => (game.game_name || '').trim().toLowerCase() === searchName)
+        || results.find(game => this._matchesAlias(game, searchName));
 
       if (!exactMatch) {
         console.log(`[HLTB] No exact match found for: ${gameName}`);
