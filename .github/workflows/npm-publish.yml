@@ -8,18 +8,31 @@ on:
     # "published" also fires when a release saved as a draft is published later,
     # which "created" does not. Using "created" silently skips those releases.
     types: [published]
-  # Lets the workflow be run by hand from the Actions tab, without having to
-  # create or delete a release (useful to recover a failed publish).
   workflow_dispatch:
+    inputs:
+      publish:
+        description: 'Publish to npm (leave unchecked to only run the tests)'
+        type: boolean
+        default: false
 
 jobs:
   build:
     runs-on: ubuntu-latest
+    strategy:
+      # Report every version, don't hide the rest behind the first failure
+      fail-fast: false
+      matrix:
+        # The floor declared in package.json "engines", plus current releases
+        node-version: [18, 20, 22, 24]
+    env:
+      # The contract tests are offline, so there is no reason to spend a
+      # ~170 MB Chrome download on each matrix job
+      PUPPETEER_SKIP_DOWNLOAD: 'true'
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
         with:
-          node-version: 24
+          node-version: ${{ matrix.node-version }}
       - run: npm ci
       # Offline contract tests: deterministic, and they exit non-zero on
       # failure, so a broken build cannot reach the publish job
@@ -27,10 +40,12 @@ jobs:
 
   publish-npm:
     needs: build
+    # A plain manual run is a test-only run; publishing has to be asked for
+    if: github.event_name == 'release' || inputs.publish
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
         with:
           node-version: 24
           registry-url: https://registry.npmjs.org/
