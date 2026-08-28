@@ -35,3 +35,6 @@ coverage/
 *.tmp
 *.temp
 .cache/
+
+# Canary report (generated)
+canary-report.md

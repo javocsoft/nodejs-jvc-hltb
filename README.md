@@ -245,16 +245,39 @@ forged (the token embeds the caller's IP and User-Agent). This library:
 
 ## 🧪 Testing
 
-Run the included test:
+Run the contract tests. They are offline and deterministic, so they don't depend
+on HowLongToBeat being reachable:
 
 ```bash
 npm test
 ```
 
-Or test with a specific game:
+They cover the shape of the request HLTB expects (the three auth headers and the
+body field named after the rotating key), the seconds-to-hours conversion, the
+recapture-once-on-403 behaviour and the failure cooldown.
+
+To check against the **live site** - the only way to catch HLTB changing its API
+again - run the smoke test:
 
 ```bash
-node test/test.js "Super Mario Bros."
+npm run test:live                       # defaults to "Mega Man"
+node test/test.js "Super Mario Bros."   # or a specific game
+```
+
+### Canary
+
+`npm run canary` checks a set of reference games against the live site and tells
+you *what kind* of breakage it found: credentials that can't be captured (they
+moved the route again) versus a contract change (the route works, the request or
+response shape doesn't).
+
+It runs automatically every Monday via the `HLTB Canary` workflow, which opens an
+issue labelled `hltb-canary` when the library stops getting data and closes it
+again when HLTB recovers. This is the only check that can catch HLTB changing
+their API - the offline tests can't, by design.
+
+```bash
+npm run canary
 ```
 
 ## 📝 Examples

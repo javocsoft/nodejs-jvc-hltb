@@ -12,7 +12,9 @@
     "CHANGELOG.md"
   ],
   "scripts": {
-    "test": "node test/test.js",
+    "test": "node --test test/contract.test.js",
+    "test:live": "node test/test.js",
+    "canary": "node test/canary.js",
     "example": "node examples/basic-usage.js"
   },
   "keywords": [

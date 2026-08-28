@@ -1,11 +1,16 @@
-# This workflow will run tests using node and then publish a package to GitHub Packages when a release is created
+# Publishes the package to npm when a GitHub release is published.
 # For more information see: https://docs.github.com/en/actions/publishing-packages/publishing-nodejs-packages
 
 name: Node.js Package
 
 on:
   release:
-    types: [created]
+    # "published" also fires when a release saved as a draft is published later,
+    # which "created" does not. Using "created" silently skips those releases.
+    types: [published]
+  # Lets the workflow be run by hand from the Actions tab, without having to
+  # create or delete a release (useful to recover a failed publish).
+  workflow_dispatch:
 
 jobs:
   build:
@@ -14,8 +19,10 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 24
       - run: npm ci
+      # Offline contract tests: deterministic, and they exit non-zero on
+      # failure, so a broken build cannot reach the publish job
       - run: npm test
 
   publish-npm:
@@ -25,7 +32,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 24
           registry-url: https://registry.npmjs.org/
       - run: npm ci
       - run: npm publish

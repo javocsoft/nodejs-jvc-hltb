@@ -1,7 +1,12 @@
 /**
- * jvc-hltb Test Script
- * 
- * Usage: node test/test.js [game name]
+ * jvc-hltb live smoke test
+ *
+ * Hits the real HowLongToBeat site, so it needs network access and a working
+ * Chrome. This is the only check that catches HLTB changing its API.
+ * For the offline contract tests run `npm test` instead.
+ *
+ * Usage: npm run test:live
+ *        node test/test.js [game name]
  * Example: node test/test.js "Mega Man"
  */
 
@@ -29,10 +34,12 @@ async function runTest() {
     } else {
       console.log('\n❌ No data found');
       console.log('The game might not exist on HowLongToBeat or the name might not match exactly.');
+      process.exitCode = 1;
     }
     
   } catch (error) {
     console.error('\n❌ Error:', error.message);
+    process.exitCode = 1;
   } finally {
     await hltb.destroy();
   }
