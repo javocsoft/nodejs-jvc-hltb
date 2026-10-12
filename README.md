@@ -1,5 +1,7 @@
 # jvc-hltb
 
+![jvc-hltb banner](https://raw.githubusercontent.com/javocsoft/nodejs-jvc-hltb/main/img/jvc-hltb-banner-github-1280x640.png)
+
 A robust **HowLongToBeat API client** for Node.js that automatically captures the dynamic credentials HLTB requires (Puppeteer request interception) to ensure reliable access to HLTB data.
 
 [![npm version](https://img.shields.io/npm/v/jvc-hltb.svg)](https://www.npmjs.com/package/jvc-hltb)
